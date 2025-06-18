@@ -59,7 +59,9 @@ def main(args):
 
     model.eval()
     
-    names, scores = task.retrieve_mols(model, args.mol_path, args.pocket_path, args.emb_dir, 10000)
+    #names, scores = task.retrieve_mols(model, args.mol_path, args.pocket_path, args.emb_dir, 10000)
+    names, scores = task.retrieve_pockets(model, args.query_pocket_path, args.target_pocket_path, args.emb_dir, 2, "21")
+    #使用一个pocket2(receptor)去检索另一个pocket1(ligand)库
 
 
 def cli_main():
@@ -67,8 +69,8 @@ def cli_main():
     
 
     parser = options.get_validation_parser()
-    parser.add_argument("--mol-path", type=str, default="", help="path for mol data")
-    parser.add_argument("--pocket-path", type=str, default="", help="path for pocket data")
+    parser.add_argument("--query-pocket-path", type=str, default="", help="path for pocket1 data")
+    parser.add_argument("--target-pocket-path", type=str, default="", help="path for pocket2 data")
     parser.add_argument("--emb-dir", type=str, default="", help="path for saved embedding data")
     options.add_model_args(parser)
     args = options.parse_args_and_arch(parser)

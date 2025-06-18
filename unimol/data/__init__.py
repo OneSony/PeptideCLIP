@@ -42,8 +42,9 @@ from .coord_pad_dataset import RightPadDatasetCoord, RightPadDatasetCross2D
 from .from_str_dataset import FromStrLabelDataset
 from .lmdb_dataset import LMDBDataset
 from .prepend_and_append_2d_dataset import PrependAndAppend2DDataset
-from .affinity_dataset import AffinityDataset, AffinityTestDataset, AffinityValidDataset, AffinityMolDataset, AffinityPocketDataset, AffinityHNSDataset, AffinityAugDataset
+# from .affinity_dataset import AffinityDataset, AffinityTestDataset, AffinityValidDataset, AffinityMolDataset, AffinityPocketDataset, AffinityHNSDataset, AffinityAugDataset
 from .pocket2mol_dataset import FragmentConformationDataset
 from .vae_binding_dataset import VAEBindingDataset, VAEBindingTestDataset, VAEGenerationTestDataset
 from .resampling_dataset import ResamplingDataset
+from .peptide_affinity_dataset import PeptideAffinityDataset, AffinityPocketDataset
 __all__ = []
