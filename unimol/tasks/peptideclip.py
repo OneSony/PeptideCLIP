@@ -165,6 +165,7 @@ class PeptideCLIP(UnicoreTask):
                 True,
             )
             tgt_dataset = KeyDataset(dataset, "affinity")
+            # 是对的, 在PeptideAffinityDataset中把label改成了affinity
             
         else:
             dataset = PeptideAffinityDataset(
@@ -389,6 +390,7 @@ class PeptideCLIP(UnicoreTask):
             distance_pocket_dataset, 0.0
         )
 
+        # TODO这里的name需要一样吗？？？
         nest_dataset = NestedDictionaryDataset(
             {
                 "net_input": {
@@ -620,12 +622,165 @@ class PeptideCLIP(UnicoreTask):
         
         query_pocket_reps = np.concatenate(query_pocket_reps, axis=0)
         
-        # 计算相似度矩阵 (query_pockets x target_pockets)
-        res = query_pocket_reps @ target_pocket_reps.T
-        res = res.max(axis=0)  # 取每个target pocket的最高相似度分数
+        # 计算相似度矩阵 (n_query x n_target)
+        similarity_matrix = query_pocket_reps @ target_pocket_reps.T
         
-        # 获取top k结果
-        top_k = np.argsort(res)[::-1][:k]
+        # 为每个query返回top-k结果
+        all_results = []
+        for i, query_name in enumerate(query_pocket_names):
+            query_similarities = similarity_matrix[i]  # 第i个query的所有相似度
+            
+            # 获取top k结果
+            top_k_indices = np.argsort(query_similarities)[::-1][:k]
+            top_k_names = [target_pocket_names[idx] for idx in top_k_indices]
+            top_k_scores = query_similarities[top_k_indices]
+            
+            result = {
+                'query_name': query_name,
+                'top_k_names': top_k_names,
+                'top_k_scores': top_k_scores
+            }
+            all_results.append(result)
+
         
-        # 返回名称和分数
-        return [target_pocket_names[i] for i in top_k], res[top_k]
+        return all_results
+    
+    
+    def test_bcma(self, model, **kwargs):
+        #ckpt_date = self.args.finetune_from_model.split("/")[-2]
+        #save_name = "/home/gaobowen/DrugClip/test_results/pcba/" + ckpt_date + ".txt"
+        save_name = ""
+        
+        targets = os.listdir("./data/bcma/")
+
+        #print(targets)
+        auc_list = []
+        ef_list = []
+        bedroc_list = []
+
+        re_list = {
+            "0.005": [],
+            "0.01": [],
+            "0.02": [],
+            "0.05": []
+        }
+        ef_list = {
+            "0.005": [],
+            "0.01": [],
+            "0.02": [],
+            "0.05": []
+        }
+        for target in targets:
+            auc, bedroc, ef, re = self.test_bcma_target(target, model)
+            auc_list.append(auc)
+            bedroc_list.append(bedroc)
+            for key in ef:
+                ef_list[key].append(ef[key])
+            # print("re", re)
+            # print("ef", ef)
+            for key in re:
+                re_list[key].append(re[key])
+        print(auc_list)
+        print(ef_list)
+        print("auc 25%", np.percentile(auc_list, 25))
+        print("auc 50%", np.percentile(auc_list, 50))
+        print("auc 75%", np.percentile(auc_list, 75))
+        print("auc mean", np.mean(auc_list))
+        print("bedroc 25%", np.percentile(bedroc_list, 25))
+        print("bedroc 50%", np.percentile(bedroc_list, 50))
+        print("bedroc 75%", np.percentile(bedroc_list, 75))
+        print("bedroc mean", np.mean(bedroc_list))
+        #print(np.median(auc_list))
+        #print(np.median(ef_list))
+        for key in ef_list:
+            print("ef", key, "25%", np.percentile(ef_list[key], 25))
+            print("ef",key, "50%", np.percentile(ef_list[key], 50))
+            print("ef",key, "75%", np.percentile(ef_list[key], 75))
+            print("ef",key, "mean", np.mean(ef_list[key]))
+        for key in re_list:
+            print("re",key, "25%", np.percentile(re_list[key], 25))
+            print("re",key, "50%", np.percentile(re_list[key], 50))
+            print("re",key, "75%", np.percentile(re_list[key], 75))
+            print("re",key, "mean", np.mean(re_list[key]))
+
+        return 
+    
+    def test_bcma_target(self, name, model, **kwargs):
+        """Encode a dataset with the molecule encoder."""
+
+        #names = "PPARG"
+        data_path = "./data/bcma/" + name + "/query.lmdb"
+        mol_dataset = self.load_mols_dataset(data_path, "atoms", "coordinates")
+        num_data = len(mol_dataset)
+        bsz=64
+        #print(num_data//bsz)
+        mol_reps = []
+        mol_names = []
+        labels = []
+        
+        # generate mol data
+        
+        mol_data = torch.utils.data.DataLoader(mol_dataset, batch_size=bsz, collate_fn=mol_dataset.collater)
+        for _, sample in enumerate(tqdm(mol_data)):
+            sample = unicore.utils.move_to_cuda(sample)
+            dist = sample["net_input"]["mol_src_distance"]
+            et = sample["net_input"]["mol_src_edge_type"]
+            st = sample["net_input"]["mol_src_tokens"]
+            mol_padding_mask = st.eq(model.mol_model.padding_idx)
+            mol_x = model.mol_model.embed_tokens(st)
+            
+            n_node = dist.size(-1)
+            gbf_feature = model.mol_model.gbf(dist, et)
+
+            gbf_result = model.mol_model.gbf_proj(gbf_feature)
+            graph_attn_bias = gbf_result
+            graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+            graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
+            mol_outputs = model.mol_model.encoder(
+                mol_x, padding_mask=mol_padding_mask, attn_mask=graph_attn_bias
+            )
+            mol_encoder_rep = mol_outputs[0][:,0,:]
+            mol_emb = model.mol_project(mol_encoder_rep)
+            mol_emb = mol_emb / mol_emb.norm(dim=1, keepdim=True)
+            mol_emb = mol_emb.detach().cpu().numpy()
+            mol_reps.append(mol_emb)
+            mol_names.extend(sample["smi_name"])
+            labels.extend(sample["target"].detach().cpu().numpy())
+        mol_reps = np.concatenate(mol_reps, axis=0)
+        labels = np.array(labels, dtype=np.int32)
+        # generate pocket data
+        data_path = "./data/lit_pcba/" + name + "/pockets.lmdb"
+        pocket_dataset = self.load_pockets_dataset(data_path)
+        pocket_data = torch.utils.data.DataLoader(pocket_dataset, batch_size=bsz, collate_fn=pocket_dataset.collater)
+        pocket_reps = []
+
+        for _, sample in enumerate(tqdm(pocket_data)):
+            sample = unicore.utils.move_to_cuda(sample)
+            dist = sample["net_input"]["pocket_src_distance"]
+            et = sample["net_input"]["pocket_src_edge_type"]
+            st = sample["net_input"]["pocket_src_tokens"]
+            pocket_padding_mask = st.eq(model.pocket_model.padding_idx)
+            pocket_x = model.pocket_model.embed_tokens(st)
+            n_node = dist.size(-1)
+            gbf_feature = model.pocket_model.gbf(dist, et)
+            gbf_result = model.pocket_model.gbf_proj(gbf_feature)
+            graph_attn_bias = gbf_result
+            graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+            graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
+            pocket_outputs = model.pocket_model.encoder(
+                pocket_x, padding_mask=pocket_padding_mask, attn_mask=graph_attn_bias
+            )
+            pocket_encoder_rep = pocket_outputs[0][:,0,:]
+            pocket_emb = model.pocket_project(pocket_encoder_rep)
+            pocket_emb = pocket_emb / pocket_emb.norm(dim=1, keepdim=True)
+            pocket_emb = pocket_emb.detach().cpu().numpy()
+            pocket_names = sample["pocket_name"]
+            pocket_reps.append(pocket_emb)
+        pocket_reps = np.concatenate(pocket_reps, axis=0)
+
+        res = pocket_reps @ mol_reps.T
+        res_single = res.max(axis=0)
+        auc, bedroc, ef_list, re_list = cal_metrics(labels, res_single, 80.5)
+
+        return auc, bedroc, ef_list, re_list
+    

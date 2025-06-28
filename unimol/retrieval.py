@@ -60,8 +60,19 @@ def main(args):
     model.eval()
     
     #names, scores = task.retrieve_mols(model, args.mol_path, args.pocket_path, args.emb_dir, 10000)
-    names, scores = task.retrieve_pockets(model, args.query_pocket_path, args.target_pocket_path, args.emb_dir, 2, "21")
+    all_results = task.retrieve_pockets(model, args.query_pocket_path, args.target_pocket_path, args.emb_dir, 100, "21")
     #使用一个pocket2(receptor)去检索另一个pocket1(ligand)库
+    with open(args.results_path, "w") as f:
+        for result in all_results:
+            query_name = result['query_name']
+            target_pocket_names = result['top_k_names']
+            target_pocket_scores = result['top_k_scores']
+            
+            line = query_name
+            for name, score in zip(target_pocket_names, target_pocket_scores):
+                line += f"\t{name}:{score:.6f}"
+            f.write(line + "\n")
+            
 
 
 def cli_main():
