@@ -25,7 +25,7 @@ from unimol.data import (PeptideAffinityDataset, CroppingPocketDataset,
                          PrependAndAppend2DDataset, RemoveHydrogenDataset,
                          RemoveHydrogenPocketDataset, RightPadDatasetCoord,
                          RightPadDatasetCross2D, TTADockingPoseDataset, AffinityPocketDataset, ResamplingDataset)
-from rdkit.ML.Scoring.Scoring import CalcBEDROC, CalcAUC, CalcEnrichment
+from rdkit.ML.Scoring.Scoring import CalcBEDROC, CalcAUC
 from sklearn.metrics import roc_curve
 logger = logging.getLogger(__name__)
 
@@ -64,25 +64,50 @@ def cal_metrics(y_true, y_score, alpha):
     Calculate BEDROC score and other metrics for pocket similarity evaluation.
     """
     scores = np.expand_dims(y_score, axis=1)
-    y_true = np.expand_dims(y_true, axis=1)
-    scores = np.concatenate((scores, y_true), axis=1)
+    y_true_array = np.array(y_true)
+    y_true_expanded = np.expand_dims(y_true_array, axis=1)
+    scores = np.concatenate((scores, y_true_expanded), axis=1)
     scores = scores[scores[:,0].argsort()[::-1]]
     bedroc = CalcBEDROC(scores, 1, 80.5)
-    count = 0
+    
+    # 计算各个比例下的positive样本统计
+    total_samples = len(y_true)
+    total_positives = int(np.sum(y_true_array))
+    
     index = np.argsort(y_score)[::-1]
-    for i in range(int(len(index)*0.005)):
-        if y_true[index[i]] == 1:
-            count += 1
     auc = CalcAUC(scores, 1)
-    ef_list = CalcEnrichment(scores, 1, [0.005, 0.01, 0.02, 0.05])
-    ef = {
-        "0.005": ef_list[0],
-        "0.01": ef_list[1],
-        "0.02": ef_list[2],
-        "0.05": ef_list[3]
-    }
-    re_list = calc_re(y_true, y_score, [0.005, 0.01, 0.02, 0.05])
-    return auc, bedroc, ef, re_list
+    
+    ratios = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+    ef = {}
+    positive_counts = {}
+    
+    for i, ratio in enumerate(ratios):
+        # 计算在这个比例下选择的样本数和其中positive的数量
+        num_selected = int(total_samples * ratio)
+        if num_selected == 0:
+            num_selected = 1  # 至少选择1个样本
+        
+        selected_indices = index[:num_selected]
+        positives_found = np.sum(y_true_array[selected_indices])
+        
+        # 手动计算EF值以确保一致性
+        expected_positives = total_positives * ratio
+        if expected_positives > 0:
+            ef_calculated = positives_found / expected_positives
+        else:
+            ef_calculated = 0.0
+        
+        # 使用我们自己计算的EF值
+        ef[str(ratio)] = ef_calculated
+        positive_counts[str(ratio)] = int(positives_found)
+        positive_counts[f"{ratio}_total"] = num_selected
+    
+    # 添加总体统计信息
+    positive_counts["total_positives"] = total_positives
+    positive_counts["total_samples"] = total_samples
+    
+    re_list = calc_re(y_true, y_score, [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5])
+    return auc, bedroc, ef, re_list, positive_counts
 
 
 @register_task("peptideclip")
@@ -332,7 +357,7 @@ class PeptideCLIP(UnicoreTask):
         else:
             self.datasets[split] = nest_dataset
 
-    def load_single_pocket_dataset(self, data_path, **kwargs):
+    def load_receptor_dataset(self, data_path, **kwargs):
         """加载单个口袋数据集，用于检索任务"""
         dataset = LMDBDataset(data_path)
         
@@ -390,31 +415,116 @@ class PeptideCLIP(UnicoreTask):
             distance_pocket_dataset, 0.0
         )
 
-        # TODO这里的name需要一样吗？？？
-        nest_dataset = NestedDictionaryDataset(
-            {
-                "net_input": {
-                    "pocket_src_tokens": RightPadDataset(
-                        src_pocket_dataset,
-                        pad_idx=self.pocket_dictionary.pad(),
-                    ),
-                    "pocket_src_distance": RightPadDataset2D(
-                        distance_pocket_dataset,
-                        pad_idx=0,
-                    ),
-                    "pocket_src_edge_type": RightPadDataset2D(
-                        pocket_edge_type,
-                        pad_idx=0,
-                    ),
-                    "pocket_src_coord": RightPadDatasetCoord(
-                        coord_pocket_dataset,
-                        pad_idx=0,
-                    ),
-                },
-                "pocket_name": RawArrayDataset(poc_dataset),
-                "pocket_len": RawArrayDataset(len_dataset),
+        nest_dataset_dict = {
+            "net_input": {
+                "pocket_src_tokens": RightPadDataset(
+                    src_pocket_dataset,
+                    pad_idx=self.pocket_dictionary.pad(),
+                ),
+                "pocket_src_distance": RightPadDataset2D(
+                    distance_pocket_dataset,
+                    pad_idx=0,
+                ),
+                "pocket_src_edge_type": RightPadDataset2D(
+                    pocket_edge_type,
+                    pad_idx=0,
+                ),
+                "pocket_src_coord": RightPadDatasetCoord(
+                    coord_pocket_dataset,
+                    pad_idx=0,
+                ),
             },
+            "pocket_name": RawArrayDataset(poc_dataset),
+            "pocket_len": RawArrayDataset(len_dataset),
+        }
+        
+        nest_dataset = NestedDictionaryDataset(nest_dataset_dict)
+        return nest_dataset
+    
+    def load_peptide_dataset(self, data_path, **kwargs):
+        """加载单个口袋数据集，用于检索任务"""
+        dataset = LMDBDataset(data_path)
+        
+        label_dataset = KeyDataset(dataset, "label")
+        
+        dataset = AffinityPocketDataset(
+            dataset,
+            self.args.seed,
+            "pocket_atoms",
+            "pocket_coordinates",
+            False,
+            "pocket"
         )
+        poc_dataset = KeyDataset(dataset, "pocket")
+        def PrependAndAppend(dataset, pre_token, app_token):
+            dataset = PrependTokenDataset(dataset, pre_token)
+            return AppendTokenDataset(dataset, app_token)
+
+        dataset = RemoveHydrogenPocketDataset(
+            dataset,
+            "pocket_atoms",
+            "pocket_coordinates",
+            True,
+            True,
+        )
+        dataset = CroppingPocketDataset(
+            dataset,
+            self.seed,
+            "pocket_atoms",
+            "pocket_coordinates",
+            self.args.max_pocket_atoms,
+        )
+
+        apo_dataset = NormalizeDataset(dataset, "pocket_coordinates")
+
+        src_pocket_dataset = KeyDataset(apo_dataset, "pocket_atoms")
+        len_dataset = LengthDataset(src_pocket_dataset)
+        src_pocket_dataset = TokenizeDataset(
+            src_pocket_dataset,
+            self.pocket_dictionary,
+            max_seq_len=self.args.max_seq_len,
+        )
+        coord_pocket_dataset = KeyDataset(apo_dataset, "pocket_coordinates")
+        src_pocket_dataset = PrependAndAppend(
+            src_pocket_dataset,
+            self.pocket_dictionary.bos(),
+            self.pocket_dictionary.eos(),
+        )
+        pocket_edge_type = EdgeTypeDataset(
+            src_pocket_dataset, len(self.pocket_dictionary)
+        )
+        coord_pocket_dataset = FromNumpyDataset(coord_pocket_dataset)
+        distance_pocket_dataset = DistanceDataset(coord_pocket_dataset)
+        coord_pocket_dataset = PrependAndAppend(coord_pocket_dataset, 0.0, 0.0)
+        distance_pocket_dataset = PrependAndAppend2DDataset(
+            distance_pocket_dataset, 0.0
+        )
+
+        nest_dataset_dict = {
+            "net_input": {
+                "pocket_src_tokens": RightPadDataset(
+                    src_pocket_dataset,
+                    pad_idx=self.pocket_dictionary.pad(),
+                ),
+                "pocket_src_distance": RightPadDataset2D(
+                    distance_pocket_dataset,
+                    pad_idx=0,
+                ),
+                "pocket_src_edge_type": RightPadDataset2D(
+                    pocket_edge_type,
+                    pad_idx=0,
+                ),
+                "pocket_src_coord": RightPadDatasetCoord(
+                    coord_pocket_dataset,
+                    pad_idx=0,
+                ),
+            },
+            "pocket_name": RawArrayDataset(poc_dataset),
+            "target": RawArrayDataset(label_dataset),
+            "pocket_len": RawArrayDataset(len_dataset),
+        }
+        
+        nest_dataset = NestedDictionaryDataset(nest_dataset_dict)
         return nest_dataset
 
     def build_model(self, args):
@@ -646,141 +756,285 @@ class PeptideCLIP(UnicoreTask):
         return all_results
     
     
-    def test_bcma(self, model, **kwargs):
-        #ckpt_date = self.args.finetune_from_model.split("/")[-2]
-        #save_name = "/home/gaobowen/DrugClip/test_results/pcba/" + ckpt_date + ".txt"
-        save_name = ""
+    def test_outer(self, data_path, model, **kwargs):
         
-        targets = os.listdir("./data/bcma/")
-
-        #print(targets)
-        auc_list = []
-        ef_list = []
-        bedroc_list = []
-
-        re_list = {
-            "0.005": [],
-            "0.01": [],
-            "0.02": [],
-            "0.05": []
-        }
-        ef_list = {
-            "0.005": [],
-            "0.01": [],
-            "0.02": [],
-            "0.05": []
-        }
-        for target in targets:
-            auc, bedroc, ef, re = self.test_bcma_target(target, model)
-            auc_list.append(auc)
-            bedroc_list.append(bedroc)
-            for key in ef:
-                ef_list[key].append(ef[key])
-            # print("re", re)
-            # print("ef", ef)
-            for key in re:
-                re_list[key].append(re[key])
-        print(auc_list)
-        print(ef_list)
-        print("auc 25%", np.percentile(auc_list, 25))
-        print("auc 50%", np.percentile(auc_list, 50))
-        print("auc 75%", np.percentile(auc_list, 75))
-        print("auc mean", np.mean(auc_list))
-        print("bedroc 25%", np.percentile(bedroc_list, 25))
-        print("bedroc 50%", np.percentile(bedroc_list, 50))
-        print("bedroc 75%", np.percentile(bedroc_list, 75))
-        print("bedroc mean", np.mean(bedroc_list))
-        #print(np.median(auc_list))
-        #print(np.median(ef_list))
-        for key in ef_list:
-            print("ef", key, "25%", np.percentile(ef_list[key], 25))
-            print("ef",key, "50%", np.percentile(ef_list[key], 50))
-            print("ef",key, "75%", np.percentile(ef_list[key], 75))
-            print("ef",key, "mean", np.mean(ef_list[key]))
-        for key in re_list:
-            print("re",key, "25%", np.percentile(re_list[key], 25))
-            print("re",key, "50%", np.percentile(re_list[key], 50))
-            print("re",key, "75%", np.percentile(re_list[key], 75))
-            print("re",key, "mean", np.mean(re_list[key]))
+        # 测试单个数据集
+        auc, bedroc, ef, re, positive_counts = self.test_inner(data_path, model)
+        
+        # 打印结果
+        print("=" * 50)
+        print("Test Results")
+        print("=" * 50)
+        print(f"AUC: {auc:.4f}")
+        print(f"BEDROC: {bedroc:.4f}")
+        print()
+        
+        print("Enrichment Factor (EF) Results:")
+        print("-" * 30)
+        for ratio in ["0.005", "0.01", "0.02", "0.05", "0.1", "0.2", "0.5"]:
+            ef_value = ef[ratio]
+            pos_count = positive_counts[ratio]
+            total_selected = positive_counts[f"{ratio}_total"]
+            print(f"EF @ {float(ratio)*100:4.1f}%: {ef_value:6.2f} (found {pos_count:3d} positives out of {total_selected:4d} selected)")
+        
+        print()
+        print("Recall Enhancement (RE) Results:")
+        print("-" * 30)
+        for ratio in ["0.005", "0.01", "0.02", "0.05", "0.1", "0.2", "0.5"]:
+            re_value = re[ratio]
+            print(f"RE @ {float(ratio)*100:4.1f}%: {re_value:6.2f}")
+        
+        print("=" * 50)
 
         return 
     
-    def test_bcma_target(self, name, model, **kwargs):
-        """Encode a dataset with the molecule encoder."""
-
-        #names = "PPARG"
-        data_path = "./data/bcma/" + name + "/query.lmdb"
-        mol_dataset = self.load_mols_dataset(data_path, "atoms", "coordinates")
-        num_data = len(mol_dataset)
-        bsz=64
-        #print(num_data//bsz)
-        mol_reps = []
-        mol_names = []
+    def test_inner(self, data_path, model, **kwargs):
+        model.eval()
+        
+        dataset = self.load_test_dataset(data_path)
+        num_data = len(dataset)
+        bsz=4
+        print(num_data//bsz)
+        score_list = []
         labels = []
+        names = []
         
-        # generate mol data
+        data = torch.utils.data.DataLoader(dataset, batch_size=bsz, collate_fn=dataset.collater)
         
-        mol_data = torch.utils.data.DataLoader(mol_dataset, batch_size=bsz, collate_fn=mol_dataset.collater)
-        for _, sample in enumerate(tqdm(mol_data)):
-            sample = unicore.utils.move_to_cuda(sample)
-            dist = sample["net_input"]["mol_src_distance"]
-            et = sample["net_input"]["mol_src_edge_type"]
-            st = sample["net_input"]["mol_src_tokens"]
-            mol_padding_mask = st.eq(model.mol_model.padding_idx)
-            mol_x = model.mol_model.embed_tokens(st)
+        with torch.no_grad():
+            for _, sample in enumerate(tqdm(data)):
+                sample = unicore.utils.move_to_cuda(sample)
+                dist = sample["net_input"]["pocket1_src_distance"]
+                et = sample["net_input"]["pocket1_src_edge_type"]
+                st = sample["net_input"]["pocket1_src_tokens"]
+                pocket1_padding_mask = st.eq(model.pocket1_model.padding_idx)
+                pocket1_x = model.pocket1_model.embed_tokens(st)
+                
+                pocket1_n_node = dist.size(-1)
+                pocket1_gbf_feature = model.pocket1_model.gbf(dist, et)
+                pocket1_gbf_result = model.pocket1_model.gbf_proj(pocket1_gbf_feature)
+                
+                pocket1_graph_attn_bias = pocket1_gbf_result
+                pocket1_graph_attn_bias = pocket1_graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+                pocket1_graph_attn_bias = pocket1_graph_attn_bias.view(-1, pocket1_n_node, pocket1_n_node)
+                
+                pocket1_outputs = model.pocket1_model.encoder(
+                    pocket1_x, padding_mask=pocket1_padding_mask, attn_mask=pocket1_graph_attn_bias
+                )
+                pocket1_rep = pocket1_outputs[0][:, 0, :]
+                
+                pocket1_emb = model.pocket1_project(pocket1_rep)
+                pocket1_emb = pocket1_emb / pocket1_emb.norm(dim=1, keepdim=True)
+                pocket1_emb = pocket1_emb.detach().cpu().numpy()
+
+                # pocket2
+                dist = sample["net_input"]["pocket2_src_distance"]
+                et = sample["net_input"]["pocket2_src_edge_type"]
+                st = sample["net_input"]["pocket2_src_tokens"]
+                pocket2_padding_mask = st.eq(model.pocket2_model.padding_idx)
+                pocket2_x = model.pocket2_model.embed_tokens(st)
+                pocket2_n_node = dist.size(-1)
+                pocket2_gbf_feature = model.pocket2_model.gbf(dist, et)
+                pocket2_gbf_result = model.pocket2_model.gbf_proj(pocket2_gbf_feature)
+                pocket2_graph_attn_bias = pocket2_gbf_result
+                pocket2_graph_attn_bias = pocket2_graph_attn_bias.permute(0,3, 1, 2).contiguous()
+                pocket2_graph_attn_bias = pocket2_graph_attn_bias.view(-1, pocket2_n_node, pocket2_n_node)
+                pocket2_outputs = model.pocket2_model.encoder(
+                    pocket2_x, padding_mask=pocket2_padding_mask, attn_mask=pocket2_graph_attn_bias
+                )
+                pocket2_rep = pocket2_outputs[0][:, 0, :]
+                pocket2_emb = model.pocket2_project(pocket2_rep)
+                pocket2_emb = pocket2_emb / pocket2_emb.norm(dim=1, keepdim=True)
+                pocket2_emb = pocket2_emb.detach().cpu().numpy()
+                
+                scores = np.sum(pocket1_emb * pocket2_emb, axis=1)
+                
+                score_list.extend(scores.tolist())
+                labels.extend(sample["target"]["finetune_target"].detach().cpu().numpy().tolist())
+                names.extend(sample["pocket1_name"])
+                
+                # 打印label和对应的name和score (可选，调试用)
+                # for i in range(len(sample["target"]["finetune_target"])):
+                #     print(f"Label: {sample['target']['finetune_target'][i]}, Name: {sample['pocket1_name'][i]}, Score: {scores[i]}")
+                # 
+                # pocket2_lens = sample["net_input"]["pocket2_len"].detach().cpu().numpy()
+                # pocket1_lens = sample["net_input"]["pocket1_len"].detach().cpu().numpy()
+                # 输出每个对象的 score 和 pocket2 残基数
+                # 输出到文件
+                # with open("/data/private/ly/CLIP_test/bcma/test/same_pocket1_score.txt", "a") as f:
+                #     for i in range(len(scores)):
+                #         line = f"{scores[i]:.4f}\t{pocket1_lens[i]}\t{pocket2_lens[i]}\t{sample['pocket1_name'][i]}\t{sample['pocket2_name'][i]}"
+                #         print(line)
+                #         f.write(line + "\n")
+                
             
-            n_node = dist.size(-1)
-            gbf_feature = model.mol_model.gbf(dist, et)
-
-            gbf_result = model.mol_model.gbf_proj(gbf_feature)
-            graph_attn_bias = gbf_result
-            graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
-            graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
-            mol_outputs = model.mol_model.encoder(
-                mol_x, padding_mask=mol_padding_mask, attn_mask=graph_attn_bias
-            )
-            mol_encoder_rep = mol_outputs[0][:,0,:]
-            mol_emb = model.mol_project(mol_encoder_rep)
-            mol_emb = mol_emb / mol_emb.norm(dim=1, keepdim=True)
-            mol_emb = mol_emb.detach().cpu().numpy()
-            mol_reps.append(mol_emb)
-            mol_names.extend(sample["smi_name"])
-            labels.extend(sample["target"].detach().cpu().numpy())
-        mol_reps = np.concatenate(mol_reps, axis=0)
-        labels = np.array(labels, dtype=np.int32)
-        # generate pocket data
-        data_path = "./data/lit_pcba/" + name + "/pockets.lmdb"
-        pocket_dataset = self.load_pockets_dataset(data_path)
-        pocket_data = torch.utils.data.DataLoader(pocket_dataset, batch_size=bsz, collate_fn=pocket_dataset.collater)
-        pocket_reps = []
-
-        for _, sample in enumerate(tqdm(pocket_data)):
-            sample = unicore.utils.move_to_cuda(sample)
-            dist = sample["net_input"]["pocket_src_distance"]
-            et = sample["net_input"]["pocket_src_edge_type"]
-            st = sample["net_input"]["pocket_src_tokens"]
-            pocket_padding_mask = st.eq(model.pocket_model.padding_idx)
-            pocket_x = model.pocket_model.embed_tokens(st)
-            n_node = dist.size(-1)
-            gbf_feature = model.pocket_model.gbf(dist, et)
-            gbf_result = model.pocket_model.gbf_proj(gbf_feature)
-            graph_attn_bias = gbf_result
-            graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
-            graph_attn_bias = graph_attn_bias.view(-1, n_node, n_node)
-            pocket_outputs = model.pocket_model.encoder(
-                pocket_x, padding_mask=pocket_padding_mask, attn_mask=graph_attn_bias
-            )
-            pocket_encoder_rep = pocket_outputs[0][:,0,:]
-            pocket_emb = model.pocket_project(pocket_encoder_rep)
-            pocket_emb = pocket_emb / pocket_emb.norm(dim=1, keepdim=True)
-            pocket_emb = pocket_emb.detach().cpu().numpy()
-            pocket_names = sample["pocket_name"]
-            pocket_reps.append(pocket_emb)
-        pocket_reps = np.concatenate(pocket_reps, axis=0)
-
-        res = pocket_reps @ mol_reps.T
-        res_single = res.max(axis=0)
-        auc, bedroc, ef_list, re_list = cal_metrics(labels, res_single, 80.5)
-
-        return auc, bedroc, ef_list, re_list
+        print(score_list)    
+        auc, bedroc, ef_list, re_list, positive_counts = cal_metrics(labels, score_list, 80.5)
+        
+        # 打印数据集基本信息
+        print(f"Dataset: {data_path}")
+        print(f"Total samples: {positive_counts['total_samples']}")
+        print(f"Total positives: {positive_counts['total_positives']}")
+        print(f"Positive ratio: {positive_counts['total_positives']/positive_counts['total_samples']:.4f}")
+        
+        return auc, bedroc, ef_list, re_list, positive_counts
     
+    def load_test_dataset(self, data_path, **kwargs):
+        """Load pocket-pocket paired dataset.
+        Expected data format:
+        'pocket1', 'pocket1_atoms', 'pocket1_coordinates', 
+        'pocket2', 'pocket2_atoms', 'pocket2_coordinates', 'label'
+        """
+        dataset = LMDBDataset(data_path)
+        
+        dataset = PeptideAffinityDataset(
+            dataset,
+            self.args.seed,
+            "pocket1_atoms",
+            "pocket1_coordinates",
+            "pocket2_atoms",
+            "pocket2_coordinates",
+            "label",
+        )
+        tgt_dataset = KeyDataset(dataset, "affinity")
+        pocket1_dataset = KeyDataset(dataset, "pocket1")
+        pocket2_dataset = KeyDataset(dataset, "pocket2")
+
+        def PrependAndAppend(dataset, pre_token, app_token):
+            dataset = PrependTokenDataset(dataset, pre_token)
+            return AppendTokenDataset(dataset, app_token)
+
+        # 处理第一个口袋
+        dataset = RemoveHydrogenPocketDataset(
+            dataset,
+            "pocket1_atoms",
+            "pocket1_coordinates",
+            True,
+            True,
+        )
+        dataset = CroppingPocketDataset(
+            dataset,
+            self.seed,
+            "pocket1_atoms",
+            "pocket1_coordinates",
+            self.args.max_pocket_atoms,
+        )
+
+        # 处理第二个口袋
+        dataset = RemoveHydrogenPocketDataset(
+            dataset,
+            "pocket2_atoms",
+            "pocket2_coordinates",
+            True,
+            True,
+        )
+        dataset = CroppingPocketDataset(
+            dataset,
+            self.seed,
+            "pocket2_atoms",
+            "pocket2_coordinates",
+            self.args.max_pocket_atoms,
+        )
+
+        # 归一化坐标
+        apo_dataset = NormalizeDataset(dataset, "pocket1_coordinates")
+        apo_dataset = NormalizeDataset(apo_dataset, "pocket2_coordinates")
+
+        # 处理第一个口袋的特征
+        src_pocket1_dataset = KeyDataset(apo_dataset, "pocket1_atoms")
+        pocket1_len_dataset = LengthDataset(src_pocket1_dataset)
+        src_pocket1_dataset = TokenizeDataset(
+            src_pocket1_dataset,
+            self.pocket_dictionary,
+            max_seq_len=self.args.max_seq_len,
+        )
+        coord_pocket1_dataset = KeyDataset(apo_dataset, "pocket1_coordinates")
+        src_pocket1_dataset = PrependAndAppend(
+            src_pocket1_dataset,
+            self.pocket_dictionary.bos(),
+            self.pocket_dictionary.eos(),
+        )
+        pocket1_edge_type = EdgeTypeDataset(
+            src_pocket1_dataset, len(self.pocket_dictionary)
+        )
+        coord_pocket1_dataset = FromNumpyDataset(coord_pocket1_dataset)
+        distance_pocket1_dataset = DistanceDataset(coord_pocket1_dataset)
+        coord_pocket1_dataset = PrependAndAppend(coord_pocket1_dataset, 0.0, 0.0)
+        distance_pocket1_dataset = PrependAndAppend2DDataset(
+            distance_pocket1_dataset, 0.0
+        )
+
+        # 处理第二个口袋的特征
+        src_pocket2_dataset = KeyDataset(apo_dataset, "pocket2_atoms")
+        pocket2_len_dataset = LengthDataset(src_pocket2_dataset)
+        src_pocket2_dataset = TokenizeDataset(
+            src_pocket2_dataset,
+            self.pocket_dictionary,
+            max_seq_len=self.args.max_seq_len,
+        )
+        coord_pocket2_dataset = KeyDataset(apo_dataset, "pocket2_coordinates")
+        src_pocket2_dataset = PrependAndAppend(
+            src_pocket2_dataset,
+            self.pocket_dictionary.bos(),
+            self.pocket_dictionary.eos(),
+        )
+        pocket2_edge_type = EdgeTypeDataset(
+            src_pocket2_dataset, len(self.pocket_dictionary)
+        )
+        coord_pocket2_dataset = FromNumpyDataset(coord_pocket2_dataset)
+        distance_pocket2_dataset = DistanceDataset(coord_pocket2_dataset)
+        coord_pocket2_dataset = PrependAndAppend(coord_pocket2_dataset, 0.0, 0.0)
+        distance_pocket2_dataset = PrependAndAppend2DDataset(
+            distance_pocket2_dataset, 0.0
+        )
+
+        nest_dataset = NestedDictionaryDataset(
+            {
+                "net_input": {
+                    # 第一个口袋的输入
+                    "pocket1_src_tokens": RightPadDataset(
+                        src_pocket1_dataset,
+                        pad_idx=self.pocket_dictionary.pad(),
+                    ),
+                    "pocket1_src_distance": RightPadDataset2D(
+                        distance_pocket1_dataset,
+                        pad_idx=0,
+                    ),
+                    "pocket1_src_edge_type": RightPadDataset2D(
+                        pocket1_edge_type,
+                        pad_idx=0,
+                    ),
+                    "pocket1_src_coord": RightPadDatasetCoord(
+                        coord_pocket1_dataset,
+                        pad_idx=0,
+                    ),
+                    "pocket1_len": RawArrayDataset(pocket1_len_dataset),
+                    
+                    # 第二个口袋的输入
+                    "pocket2_src_tokens": RightPadDataset(
+                        src_pocket2_dataset,
+                        pad_idx=self.pocket_dictionary.pad(),
+                    ),
+                    "pocket2_src_distance": RightPadDataset2D(
+                        distance_pocket2_dataset,
+                        pad_idx=0,
+                    ),
+                    "pocket2_src_edge_type": RightPadDataset2D(
+                        pocket2_edge_type,
+                        pad_idx=0,
+                    ),
+                    "pocket2_src_coord": RightPadDatasetCoord(
+                        coord_pocket2_dataset,
+                        pad_idx=0,
+                    ),
+                    "pocket2_len": RawArrayDataset(pocket2_len_dataset)
+                },
+                "target": {
+                    "finetune_target": RawLabelDataset(tgt_dataset),
+                },
+                "pocket1_name": RawArrayDataset(pocket1_dataset),
+                "pocket2_name": RawArrayDataset(pocket2_dataset),
+            },
+        )
+        
+        return nest_dataset

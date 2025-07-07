@@ -58,11 +58,20 @@ def main(args):
 
 
     model.eval()
-    if args.test_task=="DUDE":
-        task.test_dude(model)
-
-    elif args.test_task=="PCBA":
-        task.test_pcba(model)
+    if args.test_task=="BCMA":
+        task.test_outer("/data/private/ly/CLIP_test/bcma/bcma.lmdb", model)
+    elif args.test_task=="HER2":
+        task.test_outer("/data/private/ly/CLIP_test/her2/her2.lmdb", model)
+    elif args.test_task=="CD38":
+        task.test_outer("/data/private/ly/CLIP_test/cd38/cd38.lmdb", model)
+    elif args.test_task=="BCMA_same_pocket1":
+        task.test_outer("/data/private/ly/CLIP_test/bcma/test/same_pocket1", model)
+    elif args.test_task=="BCMA_same_pocket1_021":
+        task.test_outer("/data/private/ly/CLIP_test/bcma/test/same_pocket_021_D_B", model)
+    elif args.test_task=="BCMA_same_pocket1_050":
+        task.test_outer("/data/private/ly/CLIP_test/bcma/test/same_pocket_050_D_B", model)
+    elif args.test_task=="BCMA_same_pocket1_078":
+        task.test_outer("/data/private/ly/CLIP_test/bcma/test/same_pocket_078_F_L", model)
 
 
 def cli_main():
@@ -70,7 +79,7 @@ def cli_main():
     
 
     parser = options.get_validation_parser()
-    parser.add_argument("--test-task", type=str, default="DUDE", help="test task", choices=["DUDE", "PCBA"])
+    parser.add_argument("--test-task", type=str, default="BCMA", help="test task")
     options.add_model_args(parser)
     args = options.parse_args_and_arch(parser)
 
