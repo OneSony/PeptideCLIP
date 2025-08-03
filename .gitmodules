@@ -1,0 +1,3 @@
+[submodule "Uni-Core"]
+	path = Uni-Core
+	url = https://github.com/OneSony/Uni-Core
