@@ -146,12 +146,23 @@ class PeptideCLIP(UnicoreTask):
             help="selected maximum number of atoms in a pocket",
         )
         parser.add_argument(
+            "--dynamic-batch-crop",
+            action="store_true",
+            help="dynamically crop pockets in batch to same size for efficiency",
+        )
+        parser.add_argument(
             "--test-model",
             default=False,
             type=Boolean,
             help="whether test model",
         )
         parser.add_argument("--reg", action="store_true", help="regression task")
+        parser.add_argument(
+            "--batch-log-dir",
+            default=None,
+            type=str,
+            help="Directory to save batch pocket length logs (optional)"
+        )
 
     def __init__(self, args, pocket_dictionary):
         super().__init__(args)
@@ -159,6 +170,7 @@ class PeptideCLIP(UnicoreTask):
         self.seed = args.seed
         # add mask token
         self.pocket_mask_idx = pocket_dictionary.add_symbol("[MASK]", is_special=True)
+        self.batch_log_dir = getattr(args, 'batch_log_dir', None)
 
     @classmethod
     def setup_task(cls, args, **kwargs):
@@ -357,176 +369,6 @@ class PeptideCLIP(UnicoreTask):
         else:
             self.datasets[split] = nest_dataset
 
-    def load_receptor_dataset(self, data_path, **kwargs):
-        """加载单个口袋数据集，用于检索任务"""
-        dataset = LMDBDataset(data_path)
-        
-        dataset = AffinityPocketDataset(
-            dataset,
-            self.args.seed,
-            "pocket_atoms",
-            "pocket_coordinates",
-            False,
-            "pocket"
-        )
-        poc_dataset = KeyDataset(dataset, "pocket")
-
-        def PrependAndAppend(dataset, pre_token, app_token):
-            dataset = PrependTokenDataset(dataset, pre_token)
-            return AppendTokenDataset(dataset, app_token)
-
-        dataset = RemoveHydrogenPocketDataset(
-            dataset,
-            "pocket_atoms",
-            "pocket_coordinates",
-            True,
-            True,
-        )
-        dataset = CroppingPocketDataset(
-            dataset,
-            self.seed,
-            "pocket_atoms",
-            "pocket_coordinates",
-            self.args.max_pocket_atoms,
-        )
-
-        apo_dataset = NormalizeDataset(dataset, "pocket_coordinates")
-
-        src_pocket_dataset = KeyDataset(apo_dataset, "pocket_atoms")
-        len_dataset = LengthDataset(src_pocket_dataset)
-        src_pocket_dataset = TokenizeDataset(
-            src_pocket_dataset,
-            self.pocket_dictionary,
-            max_seq_len=self.args.max_seq_len,
-        )
-        coord_pocket_dataset = KeyDataset(apo_dataset, "pocket_coordinates")
-        src_pocket_dataset = PrependAndAppend(
-            src_pocket_dataset,
-            self.pocket_dictionary.bos(),
-            self.pocket_dictionary.eos(),
-        )
-        pocket_edge_type = EdgeTypeDataset(
-            src_pocket_dataset, len(self.pocket_dictionary)
-        )
-        coord_pocket_dataset = FromNumpyDataset(coord_pocket_dataset)
-        distance_pocket_dataset = DistanceDataset(coord_pocket_dataset)
-        coord_pocket_dataset = PrependAndAppend(coord_pocket_dataset, 0.0, 0.0)
-        distance_pocket_dataset = PrependAndAppend2DDataset(
-            distance_pocket_dataset, 0.0
-        )
-
-        nest_dataset_dict = {
-            "net_input": {
-                "pocket_src_tokens": RightPadDataset(
-                    src_pocket_dataset,
-                    pad_idx=self.pocket_dictionary.pad(),
-                ),
-                "pocket_src_distance": RightPadDataset2D(
-                    distance_pocket_dataset,
-                    pad_idx=0,
-                ),
-                "pocket_src_edge_type": RightPadDataset2D(
-                    pocket_edge_type,
-                    pad_idx=0,
-                ),
-                "pocket_src_coord": RightPadDatasetCoord(
-                    coord_pocket_dataset,
-                    pad_idx=0,
-                ),
-            },
-            "pocket_name": RawArrayDataset(poc_dataset),
-            "pocket_len": RawArrayDataset(len_dataset),
-        }
-        
-        nest_dataset = NestedDictionaryDataset(nest_dataset_dict)
-        return nest_dataset
-    
-    def load_peptide_dataset(self, data_path, **kwargs):
-        """加载单个口袋数据集，用于检索任务"""
-        dataset = LMDBDataset(data_path)
-        
-        label_dataset = KeyDataset(dataset, "label")
-        
-        dataset = AffinityPocketDataset(
-            dataset,
-            self.args.seed,
-            "pocket_atoms",
-            "pocket_coordinates",
-            False,
-            "pocket"
-        )
-        poc_dataset = KeyDataset(dataset, "pocket")
-        def PrependAndAppend(dataset, pre_token, app_token):
-            dataset = PrependTokenDataset(dataset, pre_token)
-            return AppendTokenDataset(dataset, app_token)
-
-        dataset = RemoveHydrogenPocketDataset(
-            dataset,
-            "pocket_atoms",
-            "pocket_coordinates",
-            True,
-            True,
-        )
-        dataset = CroppingPocketDataset(
-            dataset,
-            self.seed,
-            "pocket_atoms",
-            "pocket_coordinates",
-            self.args.max_pocket_atoms,
-        )
-
-        apo_dataset = NormalizeDataset(dataset, "pocket_coordinates")
-
-        src_pocket_dataset = KeyDataset(apo_dataset, "pocket_atoms")
-        len_dataset = LengthDataset(src_pocket_dataset)
-        src_pocket_dataset = TokenizeDataset(
-            src_pocket_dataset,
-            self.pocket_dictionary,
-            max_seq_len=self.args.max_seq_len,
-        )
-        coord_pocket_dataset = KeyDataset(apo_dataset, "pocket_coordinates")
-        src_pocket_dataset = PrependAndAppend(
-            src_pocket_dataset,
-            self.pocket_dictionary.bos(),
-            self.pocket_dictionary.eos(),
-        )
-        pocket_edge_type = EdgeTypeDataset(
-            src_pocket_dataset, len(self.pocket_dictionary)
-        )
-        coord_pocket_dataset = FromNumpyDataset(coord_pocket_dataset)
-        distance_pocket_dataset = DistanceDataset(coord_pocket_dataset)
-        coord_pocket_dataset = PrependAndAppend(coord_pocket_dataset, 0.0, 0.0)
-        distance_pocket_dataset = PrependAndAppend2DDataset(
-            distance_pocket_dataset, 0.0
-        )
-
-        nest_dataset_dict = {
-            "net_input": {
-                "pocket_src_tokens": RightPadDataset(
-                    src_pocket_dataset,
-                    pad_idx=self.pocket_dictionary.pad(),
-                ),
-                "pocket_src_distance": RightPadDataset2D(
-                    distance_pocket_dataset,
-                    pad_idx=0,
-                ),
-                "pocket_src_edge_type": RightPadDataset2D(
-                    pocket_edge_type,
-                    pad_idx=0,
-                ),
-                "pocket_src_coord": RightPadDatasetCoord(
-                    coord_pocket_dataset,
-                    pad_idx=0,
-                ),
-            },
-            "pocket_name": RawArrayDataset(poc_dataset),
-            "target": RawArrayDataset(label_dataset),
-            "pocket_len": RawArrayDataset(len_dataset),
-        }
-        
-        nest_dataset = NestedDictionaryDataset(nest_dataset_dict)
-        return nest_dataset
-
     def build_model(self, args):
         from unicore import models
 
@@ -550,7 +392,7 @@ class PeptideCLIP(UnicoreTask):
 
     def train_step(
         self, sample, model, loss, optimizer, update_num, ignore_grad=False
-    ):
+    ): # 这里的sample是取完batch后的
         """训练步骤"""
         model.train()
         model.set_num_updates(update_num)
@@ -567,6 +409,261 @@ class PeptideCLIP(UnicoreTask):
         with torch.no_grad():
             loss, sample_size, logging_output = loss(model, sample)
         return loss, sample_size, logging_output
+
+    def dynamic_crop_batch_pockets(self, sample):
+        """
+        动态裁剪batch内的pocket，使得同一个batch内的所有pocket1长度一致，所有pocket2长度一致
+        这可以减少padding开销，提高训练效率
+        """
+        # 检查是否启用了动态批量裁剪功能
+        if not getattr(self.args, 'dynamic_batch_crop', False):
+            return sample
+            
+        if "net_input" not in sample:
+            return sample
+            
+        net_input = sample["net_input"]
+        
+        # 获取batch内所有pocket1和pocket2的实际长度
+        if "pocket1_len" in net_input and "pocket2_len" in net_input:
+            pocket1_lens = net_input["pocket1_len"].cpu().numpy()
+            pocket2_lens = net_input["pocket2_len"].cpu().numpy()
+            
+            # 找到batch内pocket1和pocket2的最小长度（排除padding）
+            min_pocket1_len = int(min(pocket1_lens))
+            min_pocket2_len = int(min(pocket2_lens))
+            
+            # 确保最小长度不为0，并且有意义
+            min_pocket1_len = max(min_pocket1_len, 2)  # 至少保留[CLS]和[SEP] token
+            min_pocket2_len = max(min_pocket2_len, 2)
+            
+            # 使用CroppingPocketDataset的裁剪逻辑重新裁剪pocket1
+            if min_pocket1_len > 2 and min_pocket1_len < net_input["pocket1_src_tokens"].shape[1]:
+                self._crop_pocket_tensors(net_input, "pocket1", min_pocket1_len - 2, batch_log_dir=self.batch_log_dir)  # 减去[CLS]和[SEP]
+
+            # 使用CroppingPocketDataset的裁剪逻辑重新裁剪pocket2  
+            if min_pocket2_len > 2 and min_pocket2_len < net_input["pocket2_src_tokens"].shape[1]:
+                self._crop_pocket_tensors(net_input, "pocket2", min_pocket2_len - 2, batch_log_dir=self.batch_log_dir)  # 减去[CLS]和[SEP]
+        
+        return sample
+
+    def _crop_pocket_tensors(self, net_input, pocket_prefix, max_atoms, batch_log_dir=None):
+        """
+        使用数据处理pipeline的逻辑裁剪pocket相关的tensor
+        
+        Args:
+            net_input: 网络输入数据
+            pocket_prefix: pocket前缀 ("pocket1" 或 "pocket2")
+            max_atoms: 最大原子数（不包括[CLS]和[SEP]）
+            batch_log_dir: batch长度日志保存目录（可选）
+        """
+        from unimol.data.cropping_dataset import crop_pocket_atoms
+
+        # 获取相关tensor
+        src_tokens = net_input[f"{pocket_prefix}_src_tokens"]
+        src_coord = net_input[f"{pocket_prefix}_src_coord"]
+
+        batch_size = src_tokens.shape[0]
+
+        # 为每个样本单独处理，创建新的数据
+        new_atoms_list = []
+        new_coords_list = []
+        new_lens = []
+
+        # 记录当前batch的pocket长度到文件（可选参数）
+        if batch_log_dir is not None:
+            os.makedirs(batch_log_dir, exist_ok=True)
+            log_file = os.path.join(batch_log_dir, "batch_cropping_stats.tsv")
+
+            # 统计裁剪前的长度
+            pre_lens = net_input[f"{pocket_prefix}_len"].cpu().numpy()
+            pre_min = int(np.min(pre_lens))
+            pre_max = int(np.max(pre_lens))
+            pre_mean = float(np.mean(pre_lens))
+
+            # 先准备一行，后续补充裁剪后的长度
+            log_row = [pocket_prefix, "pre", str(pre_min), str(pre_max), f"{pre_mean:.2f}"]
+
+        for i in range(batch_size):
+            # 获取当前样本的实际长度
+            current_len = net_input[f"{pocket_prefix}_len"][i].item()
+
+            # 不再单独写入每个样本长度
+
+            # 确保长度至少为2（[CLS] + [SEP]）
+            if current_len < 2:
+                current_len = 2
+
+            # 提取当前样本的数据，使用实际长度而不是固定索引
+            # 排除[CLS](第0个)和[SEP](最后一个)
+            if current_len > 2:
+                current_tokens = src_tokens[i, 1:current_len-1]  # 排除[CLS]和[SEP]
+                current_coord = src_coord[i, 1:current_len-1, :]  # 排除对应的坐标
+            else:
+                # 如果长度不足，创建空的tensor
+                current_tokens = torch.tensor([], dtype=src_tokens.dtype, device=src_tokens.device)
+                current_coord = torch.zeros((0, 3), dtype=src_coord.dtype, device=src_coord.device)
+
+            # 找到实际有效的原子（非padding）
+            if len(current_tokens) > 0:
+                valid_mask = current_tokens != self.pocket_dictionary.pad()
+                if valid_mask.sum() == 0:
+                    # 如果没有有效原子，创建最小数据
+                    new_atoms_list.append(np.array([4, 5]))  # 默认C, N原子
+                    new_coords_list.append(np.zeros((2, 3)))
+                    new_lens.append(4)  # 2个原子 + [CLS] + [SEP]
+                    continue
+
+                valid_tokens = current_tokens[valid_mask]
+                valid_coord = current_coord[valid_mask]
+            else:
+                # 如果没有有效原子，创建最小数据
+                new_atoms_list.append(np.array([4, 5]))  # 默认C, N原子
+                new_coords_list.append(np.zeros((2, 3)))
+                new_lens.append(4)  # 2个原子 + [CLS] + [SEP]
+                continue
+
+            # 使用CroppingPocketDataset的裁剪逻辑
+            if len(valid_tokens) > max_atoms:
+                # 转换为numpy进行裁剪
+                atoms_np = valid_tokens.cpu().numpy()
+                coord_np = valid_coord.cpu().numpy()
+
+                cropped_atoms, cropped_coord, selected_indices = crop_pocket_atoms(
+                    atoms_np, coord_np, max_atoms, self.seed, i
+                )
+            else:
+                cropped_atoms = valid_tokens[:max_atoms].cpu().numpy()
+                cropped_coord = valid_coord[:max_atoms].cpu().numpy()
+
+            new_atoms_list.append(cropped_atoms)
+            new_coords_list.append(cropped_coord)
+            new_lens.append(len(cropped_atoms) + 2)  # +2 for [CLS] and [SEP]
+
+        # 换行，分隔不同batch（可选参数）
+        # 统计裁剪后的长度
+        if batch_log_dir is not None:
+            post_lens = np.array(new_lens)
+            post_min = int(np.min(post_lens))
+            post_max = int(np.max(post_lens))
+            post_mean = float(np.mean(post_lens))
+
+            # 写入一行，格式：pocket_prefix\tpre\tmin\tmax\tmean\tpost\tmin\tmax\tmean\n
+            with open(log_file, "a") as f_log:
+                f_log.write(f"{pocket_prefix}\t{pre_min}\t{pre_max}\t{pre_mean:.2f}\t{post_min}\t{post_max}\t{post_mean:.2f}\n")
+
+        # 现在按照标准pipeline重新处理这些数据
+        if not new_atoms_list:
+            # 如果没有有效数据，直接返回不做任何修改
+            return
+
+        original_device = src_tokens.device
+        processed_data = self._process_pocket_data_pipeline(
+            new_atoms_list, new_coords_list, max_atoms + 2, device=original_device
+        )
+
+        # 更新net_input
+        net_input[f"{pocket_prefix}_src_tokens"] = processed_data["tokens"]
+        net_input[f"{pocket_prefix}_src_coord"] = processed_data["coordinates"]
+        net_input[f"{pocket_prefix}_src_distance"] = processed_data["distances"]
+        net_input[f"{pocket_prefix}_src_edge_type"] = processed_data["edge_types"]
+        net_input[f"{pocket_prefix}_len"] = torch.tensor(new_lens, 
+                                                        device=net_input[f"{pocket_prefix}_len"].device)
+    
+    def _process_pocket_data_pipeline(self, atoms_list, coords_list, max_seq_len, device=None):
+        """
+        按照标准数据处理pipeline处理pocket数据
+        
+        Args:
+            atoms_list: 每个样本的原子类型列表
+            coords_list: 每个样本的坐标列表
+            max_seq_len: 最大序列长度（包括特殊token）
+            device: 目标设备，如果为None则使用CPU
+        
+        Returns:
+            dict: 包含处理后的tokens, coordinates, distances, edge_types
+        """
+        
+        batch_size = len(atoms_list)
+        
+        # 1. 创建临时数据结构来模拟dataset
+        temp_data = []
+        for i, (atoms, coords) in enumerate(zip(atoms_list, coords_list)):
+            temp_data.append({
+                'atoms': atoms,
+                'coordinates': coords.astype(np.float32)
+            })
+        
+        # 2. 模拟TokenizeDataset的处理
+        def tokenize_atoms(atoms):
+            # 将原子类型转换为词典索引（如果需要）
+            return atoms
+        
+        # 3. 为每个样本处理数据，按照pipeline逻辑
+        tokens_list = []
+        coords_list_processed = []
+        distances_list = []
+        edge_types_list = []
+        
+        for i, data in enumerate(temp_data):
+            atoms = data['atoms']
+            coords = data['coordinates']
+            
+            # 3.1 Tokenize (如果原子已经是token索引则跳过)
+            tokens = tokenize_atoms(atoms)
+            
+            # 3.2 PrependAndAppend tokens ([CLS] + atoms + [SEP])
+            tokens_with_special = np.concatenate([
+                [self.pocket_dictionary.bos()], 
+                tokens, 
+                [self.pocket_dictionary.eos()]
+            ])
+            
+            # 3.3 PrependAndAppend coordinates (0.0 + coords + 0.0)
+            coords_with_special = np.concatenate([
+                np.zeros((1, 3)), 
+                coords, 
+                np.zeros((1, 3))
+            ])
+            
+            # 3.4 计算距离矩阵
+            distance_matrix = np.linalg.norm(
+                coords_with_special[:, None, :] - coords_with_special[None, :, :], 
+                axis=2
+            )
+            
+            # 3.5 计算边类型矩阵
+            vocab_size = len(self.pocket_dictionary)
+            edge_type_matrix = (tokens_with_special[:, None] * vocab_size + 
+                              tokens_with_special[None, :])
+            
+            # 3.6 Padding到最大长度
+            padded_tokens = np.full(max_seq_len, self.pocket_dictionary.pad(), dtype=np.int64)
+            padded_coords = np.zeros((max_seq_len, 3), dtype=np.float32)
+            padded_distances = np.zeros((max_seq_len, max_seq_len), dtype=np.float32)
+            padded_edge_types = np.zeros((max_seq_len, max_seq_len), dtype=np.int64)
+            
+            seq_len = len(tokens_with_special)
+            padded_tokens[:seq_len] = tokens_with_special
+            padded_coords[:seq_len] = coords_with_special
+            padded_distances[:seq_len, :seq_len] = distance_matrix
+            padded_edge_types[:seq_len, :seq_len] = edge_type_matrix
+            
+            tokens_list.append(padded_tokens)
+            coords_list_processed.append(padded_coords)
+            distances_list.append(padded_distances)
+            edge_types_list.append(padded_edge_types)
+        
+        # 4. 转换为tensor，使用指定的设备
+        if device is None:
+            device = 'cpu'
+        
+        return {
+            "tokens": torch.tensor(np.stack(tokens_list), dtype=torch.long, device=device),
+            "coordinates": torch.tensor(np.stack(coords_list_processed), dtype=torch.float, device=device),
+            "distances": torch.tensor(np.stack(distances_list), dtype=torch.float, device=device),
+            "edge_types": torch.tensor(np.stack(edge_types_list), dtype=torch.long, device=device)
+        }
 
 
     def encode_pockets(self, model, data_path, emb_dir, pocket_index, **kwargs):

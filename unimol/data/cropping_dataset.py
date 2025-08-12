@@ -11,6 +11,43 @@ from . import data_utils
 logger = logging.getLogger(__name__)
 
 
+def crop_pocket_atoms(atoms, coordinates, max_atoms, seed=42, sample_index=0):
+    """
+    提取CroppingPocketDataset的裁剪逻辑，用于batch处理
+    
+    Args:
+        atoms: 原子类型数组
+        coordinates: 原子坐标数组 
+        max_atoms: 最大原子数
+        seed: 随机种子
+        sample_index: 样本索引（用于确保不同样本的随机性）
+    
+    Returns:
+        cropped_atoms, cropped_coordinates, selected_indices
+    """
+    if max_atoms and len(atoms) > max_atoms:
+        with data_utils.numpy_seed(seed, 1, sample_index):
+            distance = np.linalg.norm(
+                coordinates - coordinates.mean(axis=0), axis=1
+            )
+
+            def softmax(x):
+                x -= np.max(x)
+                x = np.exp(x) / np.sum(np.exp(x))
+                return x
+
+            distance += 1  # prevent inf
+            weight = softmax(np.reciprocal(distance))
+            selected_indices = np.random.choice(
+                len(atoms), max_atoms, replace=False, p=weight
+            )
+            cropped_atoms = atoms[selected_indices]
+            cropped_coordinates = coordinates[selected_indices]
+            return cropped_atoms, cropped_coordinates, selected_indices
+    else:
+        return atoms, coordinates, np.arange(len(atoms))
+
+
 class CroppingDataset(BaseWrapperDataset):
     def __init__(self, dataset, seed, atoms, coordinates, max_atoms=256):
         self.dataset = dataset

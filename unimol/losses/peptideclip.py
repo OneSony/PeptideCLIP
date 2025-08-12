@@ -53,7 +53,7 @@ class PocketContrastiveLoss(CrossEntropyLoss):
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
-        net_output = model(
+        net_output = model( # 这里调用model
             **sample["net_input"],
             pocket1_list=sample.get("pocket1_name", None),
             pocket2_list=sample.get("pocket2_name", None),
