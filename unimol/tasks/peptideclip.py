@@ -163,6 +163,12 @@ class PeptideCLIP(UnicoreTask):
             type=str,
             help="Directory to save batch pocket length logs (optional)"
         )
+        parser.add_argument(
+            "--sort_epochs",
+            type=int,
+            default=0,
+            help="Number of initial epochs to use sorted batches by length instead of random shuffling (default: 0, disabled)"
+        )
 
     def __init__(self, args, pocket_dictionary):
         super().__init__(args)
@@ -355,17 +361,34 @@ class PeptideCLIP(UnicoreTask):
             },
         )
         
+        # 创建最终的数据集
         if split == "train":
-            with data_utils.numpy_seed(self.args.seed):
-                shuffle = np.random.permutation(len(src_pocket1_dataset))
+            # 获取sort_epochs参数
+            sort_epochs = getattr(self.args, 'sort_epochs', 0)
+            
+            if sort_epochs > 0:
+                # 如果需要排序，按照pocket2长度排序
+                print(f"Sorting dataset by pocket2 length for first {sort_epochs} epochs")
+                # 获取pocket2长度并按长度排序
+                pocket2_lengths = [pocket2_len_dataset[i] for i in range(len(pocket2_len_dataset))]
 
-            self.datasets[split] = SortDataset(
-                nest_dataset,
-                sort_order=[shuffle],
-            )
-            self.datasets[split] = ResamplingDataset(
-                self.datasets[split]
-            )
+                self.datasets[split] = SortDataset(
+                    nest_dataset,
+                    sort_order=[pocket2_lengths],
+                )
+                print(f"Dataset sorted by pocket2 length (ResamplingDataset skipped)")
+            else:
+                # 不需要排序，使用随机shuffle + ResamplingDataset
+                with data_utils.numpy_seed(self.args.seed):
+                    shuffle = np.random.permutation(len(nest_dataset))
+                self.datasets[split] = SortDataset(
+                    nest_dataset,
+                    sort_order=[shuffle],
+                )
+                # 应用重采样
+                self.datasets[split] = ResamplingDataset(
+                    self.datasets[split]
+                )
         else:
             self.datasets[split] = nest_dataset
 
@@ -396,6 +419,11 @@ class PeptideCLIP(UnicoreTask):
         """训练步骤"""
         model.train()
         model.set_num_updates(update_num)
+        
+        # 在所有数据预处理操作完成后，记录最终的batch长度信息
+        if self.batch_log_dir is not None:
+            self._log_batch_lengths(sample, stage="final_before_training")
+        
         with torch.autograd.profiler.record_function("forward"):
             loss, sample_size, logging_output = loss(model, sample)
         if ignore_grad:
@@ -439,15 +467,55 @@ class PeptideCLIP(UnicoreTask):
             
             # 使用CroppingPocketDataset的裁剪逻辑重新裁剪pocket1
             if min_pocket1_len > 2 and min_pocket1_len < net_input["pocket1_src_tokens"].shape[1]:
-                self._crop_pocket_tensors(net_input, "pocket1", min_pocket1_len - 2, batch_log_dir=self.batch_log_dir)  # 减去[CLS]和[SEP]
+                self._crop_pocket_tensors(net_input, "pocket1", min_pocket1_len - 2)  # 减去[CLS]和[SEP]
 
             # 使用CroppingPocketDataset的裁剪逻辑重新裁剪pocket2  
             if min_pocket2_len > 2 and min_pocket2_len < net_input["pocket2_src_tokens"].shape[1]:
-                self._crop_pocket_tensors(net_input, "pocket2", min_pocket2_len - 2, batch_log_dir=self.batch_log_dir)  # 减去[CLS]和[SEP]
+                self._crop_pocket_tensors(net_input, "pocket2", min_pocket2_len - 2)  # 减去[CLS]和[SEP]
         
         return sample
 
-    def _crop_pocket_tensors(self, net_input, pocket_prefix, max_atoms, batch_log_dir=None):
+    def _log_batch_lengths(self, sample, stage="unknown"):
+        """
+        记录batch中pocket长度信息
+        
+        Args:
+            sample: 训练样本batch
+            stage: 记录阶段标识（如"final_before_training"）
+        """
+        if "net_input" not in sample:
+            return
+            
+        net_input = sample["net_input"]
+        
+        # 检查是否有长度信息
+        if "pocket1_len" in net_input and "pocket2_len" in net_input:
+
+            pocket1_lens = net_input["pocket1_len"].cpu().numpy()
+            pocket2_lens = net_input["pocket2_len"].cpu().numpy()
+            
+            # 统计pocket1长度
+            p1_min = int(np.min(pocket1_lens))
+            p1_max = int(np.max(pocket1_lens))
+            p1_mean = float(np.mean(pocket1_lens))
+            
+            # 统计pocket2长度
+            p2_min = int(np.min(pocket2_lens))
+            p2_max = int(np.max(pocket2_lens))
+            p2_mean = float(np.mean(pocket2_lens))
+            
+            # 创建日志文件路径
+            if self.batch_log_dir:
+                os.makedirs(self.batch_log_dir, exist_ok=True)
+                log_file = os.path.join(self.batch_log_dir, "batch_lengths.log")
+                
+                # 写入日志文件，格式：stage\tpocket_type\tmin\tmax\tmean
+                with open(log_file, "a") as f_log:
+                    f_log.write(f"{stage}\tpocket1\t{p1_min}\t{p1_max}\t{p1_mean:.2f}\n")
+                    f_log.write(f"{stage}\tpocket2\t{p2_min}\t{p2_max}\t{p2_mean:.2f}\n")
+                    f_log.write("---\n")  # 分隔不同batch
+
+    def _crop_pocket_tensors(self, net_input, pocket_prefix, max_atoms):
         """
         使用数据处理pipeline的逻辑裁剪pocket相关的tensor
         
@@ -455,7 +523,6 @@ class PeptideCLIP(UnicoreTask):
             net_input: 网络输入数据
             pocket_prefix: pocket前缀 ("pocket1" 或 "pocket2")
             max_atoms: 最大原子数（不包括[CLS]和[SEP]）
-            batch_log_dir: batch长度日志保存目录（可选）
         """
         from unimol.data.cropping_dataset import crop_pocket_atoms
 
@@ -469,20 +536,6 @@ class PeptideCLIP(UnicoreTask):
         new_atoms_list = []
         new_coords_list = []
         new_lens = []
-
-        # 记录当前batch的pocket长度到文件（可选参数）
-        if batch_log_dir is not None:
-            os.makedirs(batch_log_dir, exist_ok=True)
-            log_file = os.path.join(batch_log_dir, "batch_cropping_stats.tsv")
-
-            # 统计裁剪前的长度
-            pre_lens = net_input[f"{pocket_prefix}_len"].cpu().numpy()
-            pre_min = int(np.min(pre_lens))
-            pre_max = int(np.max(pre_lens))
-            pre_mean = float(np.mean(pre_lens))
-
-            # 先准备一行，后续补充裁剪后的长度
-            log_row = [pocket_prefix, "pre", str(pre_min), str(pre_max), f"{pre_mean:.2f}"]
 
         for i in range(batch_size):
             # 获取当前样本的实际长度
@@ -539,18 +592,6 @@ class PeptideCLIP(UnicoreTask):
             new_atoms_list.append(cropped_atoms)
             new_coords_list.append(cropped_coord)
             new_lens.append(len(cropped_atoms) + 2)  # +2 for [CLS] and [SEP]
-
-        # 换行，分隔不同batch（可选参数）
-        # 统计裁剪后的长度
-        if batch_log_dir is not None:
-            post_lens = np.array(new_lens)
-            post_min = int(np.min(post_lens))
-            post_max = int(np.max(post_lens))
-            post_mean = float(np.mean(post_lens))
-
-            # 写入一行，格式：pocket_prefix\tpre\tmin\tmax\tmean\tpost\tmin\tmax\tmean\n
-            with open(log_file, "a") as f_log:
-                f_log.write(f"{pocket_prefix}\t{pre_min}\t{pre_max}\t{pre_mean:.2f}\t{post_min}\t{post_max}\t{post_mean:.2f}\n")
 
         # 现在按照标准pipeline重新处理这些数据
         if not new_atoms_list:
